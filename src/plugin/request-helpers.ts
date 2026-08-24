@@ -725,10 +725,10 @@ export interface ThinkingConfig {
 }
 
 /**
- * Default token budget for thinking/reasoning. 16000 tokens provides sufficient
- * space for complex reasoning while staying within typical model limits.
+ * Default token budget for thinking/reasoning. 4096 tokens keeps the fallback
+ * path cheap when no explicit variant/thinking config reaches the request.
  */
-export const DEFAULT_THINKING_BUDGET = 16000;
+export const DEFAULT_THINKING_BUDGET = 4096;
 
 /**
  * Checks if a model name indicates thinking/reasoning capability.
