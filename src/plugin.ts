@@ -1586,11 +1586,7 @@ export const createAntigravityPlugin = (providerId: string) => async (
         return "Error: Not authenticated with Antigravity. Please run `opencode auth login` to authenticate.";
       }
 
-      // Get access token and project ID
-      const parts = parseRefreshParts(auth.refresh);
-      const projectId = parts.managedProjectId || parts.projectId || "unknown";
-
-      // Ensure we have a valid access token
+      // Get access token
       let accessToken = auth.access;
       if (!accessToken || accessTokenExpired(auth)) {
         try {
@@ -1603,6 +1599,16 @@ export const createAntigravityPlugin = (providerId: string) => async (
 
       if (!accessToken) {
         return "Error: No valid access token available. Please run `opencode auth login` to re-authenticate.";
+      }
+
+      // Resolve project ID using ensureProjectContext (handles managed project provisioning)
+      let projectId: string;
+      try {
+        const ctx = await ensureProjectContext({ ...auth, access: accessToken });
+        projectId = ctx.effectiveProjectId;
+      } catch (error) {
+        log.debug("Failed to resolve project context for search", { error: String(error) });
+        projectId = "unknown";
       }
 
       return executeSearch(
