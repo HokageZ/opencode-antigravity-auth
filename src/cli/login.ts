@@ -7,7 +7,8 @@
  * requests immediately route through the new account.
  *
  * Invoked by the `/antigravity-login` slash command and the "google" integration
- * command method with stdio inherited (interactive TTY prompts work as in V1).
+ * command method. `plugin-v2.ts` launches it inside a dedicated terminal window
+ * so it always gets a real interactive console.
  *
  * Usage: node dist/cli/login.cjs [directory]
  */
@@ -20,6 +21,20 @@ import type { AuthMethod, PluginClient, PluginResult } from "../plugin/types";
 // Gemini CLI `auth login`).
 process.env.ANTIGRAVITY_NO_BROWSER = "1";
 process.env.OPENCODE_HEADLESS = "1";
+
+// Refuse to run without an interactive terminal. opencode's integration runner
+// executes commands headlessly and captures their stdout — if the account menu
+// text ever lands on a non-TTY stdout it can be mistaken for a credential and
+// saved into opencode's auth store (the "Google / Google 2 / Google 3"
+// API-key credential corruption bug). Only a real terminal may drive the
+// interactive menu.
+if (!process.stdin.isTTY) {
+  console.error(
+    "[antigravity] Login requires an interactive terminal.\n" +
+      "Run `opencode auth login` from a terminal, or use the login window that opens automatically.",
+  );
+  process.exit(1);
+}
 
 function createConsoleClient() {
   return {
