@@ -303,4 +303,38 @@ describe("updateOpencodeConfig", () => {
     // But models should be replaced
     expect(writtenConfig.provider.google.models["old-model"]).toBeUndefined();
   });
+
+  test.each([
+    "/Users/test/.config/opencode/HokageZ/opencode-antigravity-auth/dist/src/plugin-v2.js",
+    "file:///Users/test/plugins/opencode-antigravity-auth/dist/src/plugin-v2.js",
+    "./plugins/HokageZ/dist/src/plugin-v2.js",
+  ])("refuses to rewrite local v2 config without adding the V1 npm plugin: %s", async (localPlugin) => {
+    const content = `{
+  // Keep this comment and model overrides untouched
+  "plugins": [{ "package": "${localPlugin}", "options": { "enabled": true } }],
+  "provider": { "google": { "models": { "custom": { "name": "Mine" } }, "region": "us" } },
+}`;
+    fs.writeFileSync(configPath, content);
+
+    const result = await updateOpencodeConfig({ configPath });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/Local Antigravity plugin/);
+    expect(fs.readFileSync(configPath, "utf-8")).toBe(content);
+  });
+
+  test("V2 standalone refuses legacy configuration even with an unrecognizable local plugin name", async () => {
+    const content = `{
+  // Keep this comment and every model override byte-for-byte
+  "plugins": ["/opt/agy/dist/index.js"],
+  "provider": { "google": { "models": { "custom": { "name": "Mine" } } } },
+}`;
+    fs.writeFileSync(configPath, content);
+
+    const result = await updateOpencodeConfig({ configPath, mode: "v2" });
+
+    expect(result.success).toBe(false);
+    expect(result.error).toMatch(/V2 plugin/);
+    expect(fs.readFileSync(configPath, "utf-8")).toBe(content);
+  });
 });

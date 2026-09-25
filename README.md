@@ -156,6 +156,16 @@ A local checkout works the same way:
 - The `/antigravity-login` slash command, or
 - The `google` integration command method: `/google antigravity-oauth`
 
+After adding, deleting, disabling, or otherwise changing accounts, reload the
+plugin or restart OpenCode. The V2 runtime stops using a stale account snapshot
+rather than writing it back over your changes. Another running instance's account
+metadata updates can also require a reload. If OpenCode started without accounts,
+reload after the first login to enable request interception.
+
+The standalone V2 login menu does not run the legacy **Configure models** updater,
+which can overwrite custom provider settings or add a legacy plugin entry. Add
+your model configuration explicitly as described below.
+
 **3. Models** — add the Antigravity models under the `google` provider using the [full models configuration](#models) below. The plugin registers the `google_search` tool and rewrites `google` provider model requests through its interceptor automatically.
 
 **4. Use it:**

@@ -4,7 +4,8 @@
  * Runs the V1 interactive OAuth flow (browser + local listener + account menu)
  * against the plugin's own account store (`~/.config/opencode/antigravity-accounts.json`),
  * which the V2 interceptor reads directly — so after this completes, model
- * requests immediately route through the new account.
+ * requests fail closed after account management until the plugin is reloaded.
+ * Reload/restart OpenCode after adding, deleting, or disabling accounts.
  *
  * Invoked by the `/antigravity-login` slash command and the "google" integration
  * command method. `plugin-v2.ts` launches it inside a dedicated terminal window
@@ -60,6 +61,7 @@ async function main(): Promise<void> {
   const surface = (await AntigravityCLIOAuthPlugin({
     client: createConsoleClient() as unknown as PluginClient,
     directory,
+    v2StandaloneCli: true,
   })) as unknown as PluginResult;
 
   const oauthMethod: AuthMethod | undefined = (surface.auth.methods ?? []).find(
