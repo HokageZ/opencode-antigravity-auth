@@ -11,7 +11,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import lockfile from "proper-lockfile";
 import type { HeaderStyle } from "../constants";
 import { createLogger } from "./logger";
@@ -396,6 +396,105 @@ async function withFileLock<T>(path: string, fn: () => Promise<T>): Promise<T> {
         log.warn("Failed to release lock", { error: String(unlockError) });
       }
     }
+  }
+}
+
+export class AccountStoreInvalidatedError extends Error {
+  constructor() {
+    super("Antigravity accounts changed on disk. Reload the plugin before making more requests.");
+    this.name = "AccountStoreInvalidatedError";
+  }
+}
+
+export interface AccountSnapshot {
+  path: string;
+  revision: string;
+  storage: AccountStorageV4;
+}
+
+function revisionOf(bytes: Buffer): string {
+  return createHash("sha256").update(bytes).digest("hex");
+}
+
+/** Read only: migration is in memory, never chmod, create, or persist. */
+export async function readAccountSnapshot(): Promise<AccountSnapshot> {
+  const path = getStoragePath();
+  let bytes: Buffer;
+  try {
+    bytes = await fs.readFile(path);
+  } catch {
+    throw new AccountStoreInvalidatedError();
+  }
+  try {
+    const raw = JSON.parse(bytes.toString("utf-8")) as AnyAccountStorage;
+    if (!Array.isArray(raw.accounts) || raw.accounts.some((account) =>
+      !account || typeof account !== "object" || typeof account.refreshToken !== "string"
+    )) throw new AccountStoreInvalidatedError();
+    let storage: AccountStorageV4;
+    if (raw.version === 1) storage = migrateV3ToV4(migrateV2ToV3(migrateV1ToV2(raw)));
+    else if (raw.version === 2) storage = migrateV3ToV4(migrateV2ToV3(raw));
+    else if (raw.version === 3) storage = migrateV3ToV4(raw);
+    else if (raw.version === 4) storage = raw;
+    else throw new AccountStoreInvalidatedError();
+    const accounts = deduplicateAccountsByEmail(storage.accounts);
+    return {
+      path,
+      revision: revisionOf(bytes),
+      storage: {
+        version: 4,
+        accounts,
+        activeIndex: accounts.length ? Math.max(0, Math.min(accounts.length - 1, Number.isInteger(storage.activeIndex) ? storage.activeIndex : 0)) : 0,
+        activeIndexByFamily: storage.activeIndexByFamily,
+      },
+    };
+  } catch {
+    throw new AccountStoreInvalidatedError();
+  }
+}
+
+export async function assertAccountSnapshotCurrent(snapshot: AccountSnapshot): Promise<void> {
+  if (getStoragePath() !== snapshot.path) throw new AccountStoreInvalidatedError();
+  let bytes: Buffer;
+  try {
+    bytes = await fs.readFile(snapshot.path);
+  } catch {
+    throw new AccountStoreInvalidatedError();
+  }
+  if (revisionOf(bytes) !== snapshot.revision) throw new AccountStoreInvalidatedError();
+}
+
+/** CAS under the same proper-lockfile lock used by legacy writes; never merge. */
+export async function saveAccountSnapshot(
+  snapshot: AccountSnapshot,
+  storage: AccountStorageV4,
+  isLive: () => boolean = () => true,
+): Promise<AccountSnapshot> {
+  if (getStoragePath() !== snapshot.path) throw new AccountStoreInvalidatedError();
+  const assertLive = () => {
+    if (!isLive()) throw new AccountStoreInvalidatedError();
+  };
+  let release: (() => Promise<void>) | undefined;
+  try {
+    // No ensureFileExists: a deleted account file must not be recreated.
+    release = await lockfile.lock(snapshot.path, LOCK_OPTIONS);
+    assertLive();
+    await assertAccountSnapshotCurrent(snapshot);
+    assertLive();
+    const content = Buffer.from(JSON.stringify(storage, null, 2));
+    const tempPath = `${snapshot.path}.${randomBytes(6).toString("hex")}.tmp`;
+    try {
+      await fs.writeFile(tempPath, content, { mode: 0o600, flag: "wx" });
+      assertLive();
+      await fs.rename(tempPath, snapshot.path);
+    } catch (error) {
+      await fs.unlink(tempPath).catch(() => {});
+      throw error;
+    }
+    return { path: snapshot.path, revision: revisionOf(content), storage };
+  } catch {
+    throw new AccountStoreInvalidatedError();
+  } finally {
+    await release?.().catch(() => {});
   }
 }
 

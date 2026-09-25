@@ -26,16 +26,20 @@
  */
 import type { Plugin } from "@opencode/plugin";
 import { createServer } from "node:http";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import type { AddressInfo } from "node:net";
 import { once } from "node:events";
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { z } from "zod";
 
 import { AntigravityCLIOAuthPlugin } from "./plugin";
 import { isGenerativeLanguageRequest } from "./plugin/request";
 import { isAgySdkSupportedRequest } from "./plugin/api-key";
 import { createLogger } from "./plugin/logger";
+import { readAccountSnapshot } from "./plugin/storage";
+import { formatRefreshParts } from "./plugin/auth";
 import type {
   GetAuth,
   LoaderResult,
@@ -122,15 +126,46 @@ type InterceptorFetch = (input: RequestInfo, init?: RequestInit) => Promise<Resp
 
 interface V2Proxy {
   port: number;
+  token: string;
   fetchInterceptor: InterceptorFetch | null;
   close(): Promise<void>;
 }
 
-async function createV2Proxy(interceptor: InterceptorFetch | null): Promise<V2Proxy> {
+const PROXY_TARGET_HOSTS = new Set([
+  "generativelanguage.googleapis.com",
+  "daily-cloudcode-pa.sandbox.googleapis.com",
+  "autopush-cloudcode-pa.sandbox.googleapis.com",
+  "cloudcode-pa.googleapis.com",
+]);
+
+function validProxyTarget(target: string): boolean {
+  try {
+    const url = new URL(target);
+    if (url.protocol !== "https:" || url.username || url.password || url.port || !PROXY_TARGET_HOSTS.has(url.hostname)) return false;
+    if (url.hostname !== "generativelanguage.googleapis.com") {
+      return /^\/v1internal:(generateContent|streamGenerateContent)$/.test(url.pathname);
+    }
+    return /^\/v1(?:beta)?\/models\/[A-Za-z0-9._-]+:(generateContent|streamGenerateContent)$/.test(url.pathname);
+  } catch {
+    return false;
+  }
+}
+
+export async function createV2Proxy(interceptor: InterceptorFetch | null): Promise<V2Proxy> {
+  const token = randomBytes(32).toString("hex");
   const server = createServer(async (req, res) => {
     if (req.method !== "POST" || req.url !== "/antigravity/proxy") {
       res.writeHead(404, { "content-type": "text/plain" });
       res.end("not found");
+      return;
+    }
+
+    const supplied = req.headers["x-antigravity-proxy-token"];
+    const provided = typeof supplied === "string" ? Buffer.from(supplied) : Buffer.alloc(0);
+    const expected = Buffer.from(token);
+    if (provided.length !== expected.length || !timingSafeEqual(provided, expected)) {
+      res.writeHead(403, { "content-type": "text/plain" });
+      res.end("forbidden");
       return;
     }
 
@@ -141,12 +176,18 @@ async function createV2Proxy(interceptor: InterceptorFetch | null): Promise<V2Pr
       res.end("missing x-antigravity-target");
       return;
     }
+    if (!validProxyTarget(target)) {
+      res.writeHead(400, { "content-type": "text/plain" });
+      res.end("invalid x-antigravity-target");
+      return;
+    }
 
     const chunks: Buffer[] = [];
     try {
       for await (const chunk of req) chunks.push(chunk as Buffer);
     } catch {
-      // client aborted mid-body; fall through with what we have
+      // Never dispatch a truncated request after a client upload fails.
+      return;
     }
     const body = Buffer.concat(chunks).toString("utf8");
 
@@ -158,13 +199,27 @@ async function createV2Proxy(interceptor: InterceptorFetch | null): Promise<V2Pr
         headers = {};
       }
     }
+    // Never relay credentials for the local proxy to Google, regardless of
+    // whether the caller supplied them as HTTP headers or serialized headers.
+    for (const name of Object.keys(headers)) {
+      if (name.toLowerCase() === "x-antigravity-proxy-token") delete headers[name];
+    }
 
     const controller = new AbortController();
     const onAborted = () => controller.abort();
     req.on("aborted", onAborted);
     req.on("error", onAborted);
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    const onResponseClosed = () => {
+      // req.aborted does not fire when the client disconnects after upload.
+      if (res.writableFinished) return;
+      controller.abort();
+      void reader?.cancel().catch(() => {});
+    };
+    res.on("close", onResponseClosed);
 
     try {
+      if (req.aborted || res.destroyed || controller.signal.aborted) return;
       if (!interceptor) {
         res.writeHead(502, { "content-type": "text/plain" });
         res.end("antigravity interceptor unavailable");
@@ -177,6 +232,7 @@ async function createV2Proxy(interceptor: InterceptorFetch | null): Promise<V2Pr
         body: body.length > 0 ? body : undefined,
         signal: controller.signal,
       });
+      if (controller.signal.aborted) return;
 
       // Copy upstream headers, dropping hop-by-hop / framing headers the
       // loopback transport re-derives itself.
@@ -194,7 +250,7 @@ async function createV2Proxy(interceptor: InterceptorFetch | null): Promise<V2Pr
         return;
       }
 
-      const reader = upstream.body.getReader();
+      reader = upstream.body.getReader();
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
@@ -211,6 +267,7 @@ async function createV2Proxy(interceptor: InterceptorFetch | null): Promise<V2Pr
     } finally {
       req.removeListener("aborted", onAborted);
       req.removeListener("error", onAborted);
+      res.removeListener("close", onResponseClosed);
     }
   });
 
@@ -226,25 +283,45 @@ async function createV2Proxy(interceptor: InterceptorFetch | null): Promise<V2Pr
       setTimeout(resolve, 1000).unref();
     });
 
-  return { port, fetchInterceptor: interceptor, close };
+  return { port, token, fetchInterceptor: interceptor, close };
 }
 
 // ---------------------------------------------------------------------------
 // Login CLI (bundled entry, also runnable standalone)
 // ---------------------------------------------------------------------------
 
-function loginCliUrl(): URL {
+export function loginCliUrl(moduleUrl: string = import.meta.url): URL {
   // Resolve to the bundled CLI (dist/cli/login.cjs, see build:cli). The `..`
   // depth depends on where this module lives: ../ from the source tree
   // (src/plugin-v2.ts) reaches the package root, ../../ is needed from the
   // compiled build (dist/src/plugin-v2.js).
-  const fromSource = /\/src\//.test(import.meta.url) || /\\src\\/.test(import.meta.url);
+  const fromSource = new URL(moduleUrl).pathname.endsWith("/src/plugin-v2.ts");
   const relative = fromSource ? "../dist/cli/login.cjs" : "../../dist/cli/login.cjs";
-  return new URL(relative, import.meta.url);
+  return new URL(relative, moduleUrl);
+}
+
+async function diskOAuthAuth(): Promise<Awaited<ReturnType<GetAuth>>> {
+  const stored = (await readAccountSnapshot()).storage;
+  const accounts = stored?.accounts ?? [];
+  const active = accounts[stored?.activeIndexByFamily?.gemini ?? stored?.activeIndex ?? 0];
+  const account = active?.refreshToken && active.enabled !== false
+    ? active
+    : accounts.find((candidate) => candidate.enabled !== false && !!candidate.refreshToken);
+  if (!account) return { type: "none" };
+  return {
+    type: "oauth",
+    refresh: formatRefreshParts({
+      refreshToken: account.refreshToken,
+      projectId: account.projectId,
+      managedProjectId: account.managedProjectId,
+    }),
+    access: "",
+    expires: 0,
+  };
 }
 
 /** argv that launches the bundled login CLI inside a real terminal window. */
-function loginCommandArgs(directory: string): string[] {
+export function loginCommandArgs(directory: string): string[] {
   const script = fileURLToPath(loginCliUrl());
   if (process.platform === "win32") {
     // `start` treats its first quoted argument as the window title; /wait
@@ -252,7 +329,13 @@ function loginCommandArgs(directory: string): string[] {
     return ["cmd", "/c", "start", "Antigravity Login", "/wait", "node", script, directory];
   }
   if (process.platform === "darwin") {
-    return ["osascript", "-e", `tell application "Terminal" to do script "node '${script}' '${directory}'"`];
+    // Keep untrusted paths out of AppleScript source AND out of the shell
+    // expression. AppleScript's quoted form handles apostrophes and spaces.
+    return [
+      "osascript", "-e",
+      'on run argv\nset scriptPath to item 1 of argv\nset directoryPath to item 2 of argv\ntell application "Terminal" to do script ("node " & quoted form of scriptPath & " " & quoted form of directoryPath)\nend run',
+      script, directory,
+    ];
   }
   // Linux: launch via a terminal emulator (the on('error') handler below
   // covers emulators that aren't installed).
@@ -292,19 +375,21 @@ export default {
     // 1. V1 client shim over the V2 context (initialized inside `createAntigravityPlugin`).
     const client = createV2Client(ctx);
 
-    // 2. Build the V1 surface. `getAuth` always resolves to a non-OAuth value so
-    //    the loader promotes accounts from the plugin's own disk store.
-    const surface = (await AntigravityCLIOAuthPlugin({ client, directory })) as unknown as PluginResult;
+    // 2. Build the V1 surface. Read on each call so login/rotation is visible
+    //    to both the interceptor and the google_search tool without logging tokens.
+    const surface = (await AntigravityCLIOAuthPlugin({ client, directory, accountStorageConsistency: "fail-closed" })) as unknown as PluginResult;
 
     // 3. Fetch interceptor from the V1 auth loader.
     let interceptorFetch: InterceptorFetch | null = null;
+    let disposeLoader: LoaderResult["dispose"];
     try {
       const loader = await surface.auth.loader(
-        (async () => ({})) as GetAuth,
+        diskOAuthAuth,
         { id: "google", models: {} } as Provider,
       );
       if (loader && typeof (loader as LoaderResult).fetch === "function") {
         interceptorFetch = (loader as LoaderResult).fetch as InterceptorFetch;
+        disposeLoader = (loader as LoaderResult).dispose;
         log.debug("interceptor-ready", {});
       } else {
         log.debug("interceptor-unavailable", {});
@@ -317,6 +402,9 @@ export default {
     const proxy = await createV2Proxy(interceptorFetch);
     const registrations: Array<{ dispose: () => Promise<void> }> = [];
 
+    // Limitation: if the plugin starts without accounts, the V1 loader has no
+    // interceptor. The integration login remains available, but the plugin
+    // must be reloaded after adding the first account to enable interception.
     if (proxy.fetchInterceptor) {
       registrations.push(
         await ctx.session.hook("http.request", async (event) => {
@@ -337,6 +425,7 @@ export default {
                 ...headers,
                 "x-antigravity-target": url,
                 "x-antigravity-headers": JSON.stringify(headers),
+                "x-antigravity-proxy-token": proxy.token,
               },
               body: body.length > 0 ? body : undefined,
               signal: event.request.signal,
@@ -348,22 +437,23 @@ export default {
       );
     }
 
-    // 5. google_search tool (reuses the V1 tool; V2 accepts the zod args schema).
+    // 5. google_search tool (reuse V1 executor with V2 JSON Schema input).
     const v1Tool = (surface.tool as Record<string, unknown> | undefined)?.google_search as
       | { description: string; args: unknown; execute: (args: unknown, ctx: { abort: AbortSignal }) => Promise<unknown> }
       | undefined;
     if (v1Tool) {
+      const searchArgs = z.object(v1Tool.args as Record<string, z.ZodType>);
       registrations.push(
-        await ctx.tool.transform(async (editor) => {
+        await ctx.tool.transform((editor) => {
           editor.add({
-            id: "google_search",
+            name: "google_search",
             description: v1Tool.description,
-            input: v1Tool.args,
-            execute: async (input: { value: unknown }, toolContext: { signal: AbortSignal }) => {
-              const result = await v1Tool.execute(input.value, { abort: toolContext.signal });
+            input: z.toJSONSchema(searchArgs),
+            execute: async (input, toolContext) => {
+              const result = await v1Tool.execute(searchArgs.parse(input), { abort: toolContext.signal });
               return { content: String(result ?? "") };
             },
-          } as never);
+          });
         }),
       );
     }
@@ -428,6 +518,7 @@ export default {
 
     // 8. Cleanup on unload.
     return async () => {
+      await disposeLoader?.();
       eventAbort.abort();
       await eventForwarding.catch(() => {});
       await Promise.allSettled(registrations.map((reg) => reg.dispose()));

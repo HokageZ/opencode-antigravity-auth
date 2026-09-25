@@ -46,6 +46,7 @@ export interface ProviderHook {
 export interface LoaderResult {
   apiKey: string;
   fetch(input: RequestInfo, init?: RequestInit): Promise<Response>;
+  dispose?: () => void | Promise<void>;
 }
 
 export type PluginClient = PluginInput["client"];
@@ -53,6 +54,9 @@ export type PluginClient = PluginInput["client"];
 export interface PluginContext {
   client: PluginClient;
   directory: string;
+  /** Standalone V2 login CLI: refuse the legacy V1 models updater. */
+  v2StandaloneCli?: boolean;
+  accountStorageConsistency?: "fail-closed";
 }
 
 export type AuthPrompt =

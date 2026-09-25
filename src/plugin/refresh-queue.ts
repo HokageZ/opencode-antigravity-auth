@@ -20,6 +20,7 @@ import type { AccountManager, ManagedAccount } from "./accounts";
 import type { PluginClient, OAuthAuthDetails } from "./types";
 import { refreshAccessToken } from "./token";
 import { createLogger } from "./logger";
+import { AccountStoreInvalidatedError } from "./storage";
 
 const log = createLogger("refresh-queue");
 
@@ -161,6 +162,7 @@ export class ProactiveRefreshQueue {
     this.state.lastCheckTime = Date.now();
 
     try {
+      await this.accountManager.assertCurrent();
       const accountsToRefresh = this.getAccountsNeedingRefresh();
 
       if (accountsToRefresh.length === 0) {
@@ -177,8 +179,10 @@ export class ProactiveRefreshQueue {
         }
 
         try {
+          await this.accountManager.assertCurrent();
           const auth = this.accountManager.toAuthDetails(account);
           const refreshed = await this.refreshToken(auth, account);
+          await this.accountManager.assertCurrent();
 
           if (refreshed) {
             this.accountManager.updateFromAuth(account, refreshed);
@@ -188,11 +192,16 @@ export class ProactiveRefreshQueue {
             // Persist the refreshed token
             try {
               await this.accountManager.saveToDisk();
-            } catch {
+            } catch (error) {
+              if (error instanceof AccountStoreInvalidatedError) throw error;
               // Non-fatal - token is refreshed in memory
             }
           }
         } catch (error) {
+          if (error instanceof AccountStoreInvalidatedError) {
+            this.stop();
+            return;
+          }
           this.state.errorCount++;
           // Log but don't throw - continue with other accounts
           log.warn("Failed to refresh account", {
@@ -201,6 +210,12 @@ export class ProactiveRefreshQueue {
           });
         }
       }
+    } catch (error) {
+      if (error instanceof AccountStoreInvalidatedError) {
+        this.stop();
+        return;
+      }
+      throw error;
     } finally {
       this.state.isRefreshing = false;
     }
