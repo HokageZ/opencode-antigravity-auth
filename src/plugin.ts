@@ -225,8 +225,15 @@ async function modelsFromOAuthAuth(
 
   const parts = parseRefreshParts(auth.refresh);
   const projectId = parts.managedProjectId || parts.projectId || ANTIGRAVITY_DEFAULT_PROJECT_ID;
-  const response = await fetchAvailableModels(accessToken, projectId);
-  return modelsFromAntigravityAvailableModels(response.models ?? {});
+  try {
+    const response = await fetchAvailableModels(accessToken, projectId);
+    return modelsFromAntigravityAvailableModels(response.models ?? {});
+  } catch (error) {
+    log.debug("antigravity-model-discovery-failed", {
+      error: error instanceof Error ? error.message : String(error),
+    });
+    return {};
+  }
 }
 
 function hasProviderModelRuntimeShape(model: ProviderModel | undefined): boolean {

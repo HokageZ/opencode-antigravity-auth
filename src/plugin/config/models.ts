@@ -41,6 +41,11 @@ export interface GeminiApiModel {
   supportedGenerationMethods?: string[];
 }
 
+export interface GeminiApiModelsResponse {
+  models?: GeminiApiModel[];
+  nextPageToken?: string;
+}
+
 export interface AntigravityAvailableModel {
   displayName?: string;
   modelName?: string;

@@ -8,6 +8,7 @@ import { logQuotaFetch, logQuotaStatus } from "./debug";
 import { ensureProjectContext } from "./project";
 import { refreshAccessToken } from "./token";
 import { getModelFamily } from "./transform/model-resolver";
+import type { AntigravityAvailableModel } from "./config/models";
 import type { PluginClient, OAuthAuthDetails } from "./types";
 import type { AccountMetadataV3 } from "./storage";
 
@@ -66,13 +67,11 @@ export interface FetchAvailableModelsResponse {
   models?: Record<string, FetchAvailableModelEntry>;
 }
 
-export interface FetchAvailableModelEntry {
+export interface FetchAvailableModelEntry extends AntigravityAvailableModel {
   quotaInfo?: {
     remainingFraction?: number;
     resetTime?: string;
   };
-  displayName?: string;
-  modelName?: string;
 }
 
 function buildAuthFromAccount(account: AccountMetadataV3): OAuthAuthDetails {
@@ -177,8 +176,6 @@ export async function fetchAvailableModels(
 ): Promise<FetchAvailableModelsResponse> {
   const endpoint = ANTIGRAVITY_ENDPOINT_PROD;
   const quotaUserAgent = getAntigravityHeaders()["User-Agent"] || "antigravity/windows/amd64";
-  const errors: string[] = [];
-
   const body = projectId ? { project: projectId } : {};
   const response = await fetchWithTimeout(`${endpoint}/v1internal:fetchAvailableModels`, {
     method: "POST",
@@ -196,11 +193,7 @@ export async function fetchAvailableModels(
 
   const message = await response.text().catch(() => "");
   const snippet = message.trim().slice(0, 200);
-  errors.push(
-    `fetchAvailableModels ${response.status} at ${endpoint}${snippet ? `: ${snippet}` : ""}`,
-  );
-
-  throw new Error(errors.join("; ") || "fetchAvailableModels failed");
+  throw new Error(`fetchAvailableModels ${response.status} at ${endpoint}${snippet ? `: ${snippet}` : ""}`);
 }
 
 async function fetchGeminiCliQuota(
