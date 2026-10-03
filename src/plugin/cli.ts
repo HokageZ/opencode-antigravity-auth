@@ -105,7 +105,7 @@ async function promptLoginModeFallback(existingAccounts: ExistingAccountInfo[]):
   }
 }
 
-export async function promptLoginMode(existingAccounts: ExistingAccountInfo[]): Promise<LoginMenuResult> {
+export async function promptLoginMode(existingAccounts: ExistingAccountInfo[], options: { v2StandaloneCli?: boolean } = {}): Promise<LoginMenuResult> {
   if (!isTTY()) {
     return promptLoginModeFallback(existingAccounts);
   }
@@ -159,7 +159,7 @@ export async function promptLoginMode(existingAccounts: ExistingAccountInfo[]): 
         return { mode: "fresh", deleteAll: true };
 
       case "configure-models": {
-        const result = await updateOpencodeConfig();
+        const result = await updateOpencodeConfig({ mode: options.v2StandaloneCli ? "v2" : "v1" });
         if (result.success) {
           console.log(`\n✓ Models configured in ${result.configPath}\n`);
         } else {

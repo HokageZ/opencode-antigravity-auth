@@ -22,6 +22,7 @@ export interface UpdateConfigResult {
 export interface OpencodeConfig {
   $schema?: string;
   plugin?: string[];
+  plugins?: Array<string | { package?: string; [key: string]: unknown }>;
   provider?: {
     google?: {
       models?: Record<string, unknown>;
@@ -35,6 +36,8 @@ export interface OpencodeConfig {
 export interface UpdateConfigOptions {
   /** Override the config file path (for testing) */
   configPath?: string;
+  /** V2 standalone login never runs the V1 config rewrite, regardless of plugin path. */
+  mode?: "v1" | "v2";
 }
 
 // =============================================================================
@@ -45,6 +48,13 @@ const PLUGIN_NAME = "opencode-antigravity-auth@latest";
 const SCHEMA_URL = "https://opencode.ai/config.json";
 const OPENCODE_JSON_FILENAME = "opencode.json";
 const OPENCODE_JSONC_FILENAME = "opencode.jsonc";
+
+function isLocalAntigravityPlugin(entry: string | { package?: string; [key: string]: unknown }): boolean {
+  const name = typeof entry === "string" ? entry : entry?.package;
+  if (typeof name !== "string") return false;
+  const local = name.startsWith("/") || name.startsWith("./") || name.startsWith("../") || name.startsWith("file:");
+  return local && /hokagez|opencode-antigravity-auth|plugin-v2/i.test(name);
+}
 
 function stripJsonCommentsAndTrailingCommas(json: string): string {
   return json
@@ -109,6 +119,14 @@ export async function updateOpencodeConfig(
 ): Promise<UpdateConfigResult> {
   const configPath = options.configPath ?? getOpencodeConfigPath();
 
+  if (options.mode === "v2") {
+    return {
+      success: false,
+      configPath,
+      error: "V2 plugin uses provider transforms; configure models manually (config left unchanged).",
+    };
+  }
+
   try {
     let config: OpencodeConfig;
 
@@ -116,6 +134,16 @@ export async function updateOpencodeConfig(
     if (existsSync(configPath)) {
       const content = readFileSync(configPath, "utf-8");
       config = JSON.parse(stripJsonCommentsAndTrailingCommas(content)) as OpencodeConfig;
+      // V2 configurations use a local plugin entry and provider transforms.
+      // Re-serializing JSONC here would erase comments and replace user model
+      // overrides; adding the legacy npm V1 plugin would also break V2 loading.
+      if (config.plugins?.some(isLocalAntigravityPlugin) || config.plugin?.some(isLocalAntigravityPlugin)) {
+        return {
+          success: false,
+          configPath,
+          error: "Local Antigravity plugin configured; configure models manually (config left unchanged).",
+        };
+      }
     } else {
       // Create default config structure
       config = {

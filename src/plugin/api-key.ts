@@ -1,5 +1,6 @@
 import { extractVariantThinkingConfig } from "./request-helpers";
 import { applyGeminiTransforms, isGemini3Model, mapAntigravityModelToPublicApi, resolveModelForHeaderStyle } from "./transform";
+import { realFetch } from "./network";
 import type { AntigravityConfig } from "./config";
 import type { GeminiApiModel } from "./config/models";
 import type { ApiKeyAuthDetails } from "./types";
@@ -569,7 +570,7 @@ async function fetchGeminiModelsPage(url: string, credential: AgySdkCredential):
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), GEMINI_MODELS_LIST_TIMEOUT_MS);
   try {
-    return await fetch(url, {
+    return await realFetch(url, {
       signal: controller.signal,
       headers: {
         "x-goog-api-key": credential.apiKey,
@@ -587,7 +588,7 @@ export async function fetchWithAgySdkCredential(
   fallbackRetryAfterMs: number,
 ): Promise<Response> {
   const prepared = await prepareAgySdkGeminiRequest(input, init, credential);
-  const response = await fetch(prepared.request, prepared.init);
+  const response = await realFetch(prepared.request, prepared.init);
   if (response.status === 429 || response.status === 503 || response.status === 529) {
     markAgySdkCredentialRateLimited(credential, retryAfterMsFromResponse(response, fallbackRetryAfterMs));
   }

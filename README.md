@@ -128,6 +128,62 @@ opencode run "Hello" --model=google/antigravity-claude-opus-4-6-thinking --varia
 
 ---
 
+## OpenCode V2
+
+<details open>
+<summary><b>V2 (OpenCode 2.x) — install & usage</b></summary>
+
+Since **OpenCode 2.0.12** this plugin runs natively under the V2 plugin system (V1 plugins do not load on V2). On a V2 build, install as follows — the V1 instructions above do not apply.
+
+**1. Add the plugin** to `~/.config/opencode/opencode.json`. V2 uses a `plugins` array (note the `s` — a V1 `plugin` key is ignored by V2):
+
+```jsonc
+{
+  "plugins": ["opencode-antigravity-auth@latest"]
+}
+```
+
+A local checkout works the same way:
+
+```jsonc
+{
+  "plugins": ["/path/to/opencode-antigravity-auth"]
+}
+```
+
+**2. Login** with your Google account. There is no `opencode auth login` flow for this plugin on V2 — instead use one of:
+
+- The `/antigravity-login` slash command, or
+- The `google` integration command method: `/google antigravity-oauth`
+
+After adding, deleting, disabling, or otherwise changing accounts, reload the
+plugin or restart OpenCode. The V2 runtime stops using a stale account snapshot
+rather than writing it back over your changes. Another running instance's account
+metadata updates can also require a reload. If OpenCode started without accounts,
+reload after the first login to enable request interception.
+
+The standalone V2 login menu does not run the legacy **Configure models** updater,
+which can overwrite custom provider settings or add a legacy plugin entry. Add
+your model configuration explicitly as described below.
+
+**3. Models** — add the Antigravity models under the `google` provider using the [full models configuration](#models) below. The plugin registers the `google_search` tool and rewrites `google` provider model requests through its interceptor automatically.
+
+**4. Use it:**
+
+```bash
+opencode run "Hello" --model google/antigravity-claude-opus-4-6-thinking
+```
+
+Verify the plugin loaded:
+
+```bash
+opencode api get /api/plugin   # opencode-antigravity-auth → status "active"
+```
+
+</details>
+
+---
+
 ## Models
 
 ### Model Reference

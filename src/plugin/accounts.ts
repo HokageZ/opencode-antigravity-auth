@@ -1,5 +1,5 @@
 import { formatRefreshParts, parseRefreshParts } from "./auth";
-import { loadAccounts, saveAccounts, type AccountStorageV4, type AccountMetadataV3, type RateLimitStateV3, type ModelFamily, type HeaderStyle, type CooldownReason } from "./storage";
+import { loadAccounts, saveAccounts, readAccountSnapshot, assertAccountSnapshotCurrent, saveAccountSnapshot, AccountStoreInvalidatedError, type AccountSnapshot, type AccountStorageV4, type AccountMetadataV3, type RateLimitStateV3, type ModelFamily, type HeaderStyle, type CooldownReason } from "./storage";
 import type { OAuthAuthDetails, RefreshParts } from "./types";
 import type { AccountSelectionStrategy } from "./config/schema";
 import { getHealthTracker, getTokenTracker, selectHybridAccount, type AccountWithMetrics } from "./rotation";
@@ -311,14 +311,29 @@ export class AccountManager {
 
   private savePending = false;
   private saveTimeout: ReturnType<typeof setTimeout> | null = null;
-  private savePromiseResolvers: Array<() => void> = [];
+  private savePromiseResolvers: Array<{ resolve: () => void; reject: (error: Error) => void }> = [];
+  private guardQueue: Promise<void> = Promise.resolve();
+  private invalidated = false;
+  private onInvalidated?: () => void;
+  private snapshot?: AccountSnapshot;
 
-  static async loadFromDisk(authFallback?: OAuthAuthDetails): Promise<AccountManager> {
+  static async loadFromDisk(authFallback?: OAuthAuthDetails, consistency?: "fail-closed"): Promise<AccountManager> {
+    if (consistency === "fail-closed") {
+      const snapshot = await readAccountSnapshot();
+      if (authFallback) {
+        const refreshToken = parseRefreshParts(authFallback.refresh).refreshToken;
+        if (!snapshot.storage.accounts.some((account) => account.refreshToken === refreshToken)) {
+          throw new AccountStoreInvalidatedError();
+        }
+      }
+      return new AccountManager(authFallback, snapshot.storage, snapshot);
+    }
     const stored = await loadAccounts();
     return new AccountManager(authFallback, stored);
   }
 
-  constructor(authFallback?: OAuthAuthDetails, stored?: AccountStorageV4 | null) {
+  constructor(authFallback?: OAuthAuthDetails, stored?: AccountStorageV4 | null, snapshot?: AccountSnapshot) {
+    this.snapshot = snapshot;
     const authParts = authFallback ? parseRefreshParts(authFallback.refresh) : null;
 
     if (stored && stored.accounts.length === 0) {
@@ -454,7 +469,57 @@ export class AccountManager {
   }
 
   getAccountCount(): number {
+    this.throwIfInvalidated();
     return this.getEnabledAccounts().length;
+  }
+
+  setInvalidationHandler(handler: () => void): void {
+    this.onInvalidated = handler;
+    if (this.invalidated) handler();
+  }
+
+  invalidate(): void {
+    if (this.invalidated) return;
+    this.invalidated = true;
+    if (this.saveTimeout) clearTimeout(this.saveTimeout);
+    this.saveTimeout = null;
+    this.savePending = false;
+    const waiters = this.savePromiseResolvers.splice(0);
+    for (const waiter of waiters) waiter.reject(new AccountStoreInvalidatedError());
+    this.onInvalidated?.();
+  }
+
+  /** Stop new work and wait for any already-started conditional write. No flush. */
+  async dispose(): Promise<void> {
+    this.invalidate();
+    await this.guardQueue;
+  }
+
+  private throwIfInvalidated(): void {
+    if (this.invalidated) throw new AccountStoreInvalidatedError();
+  }
+
+  private async guarded<T>(action: () => Promise<T>): Promise<T> {
+    const next = this.guardQueue.then(async () => {
+      this.throwIfInvalidated();
+      try {
+        const result = await action();
+        this.throwIfInvalidated();
+        return result;
+      } catch {
+        this.invalidate();
+        throw new AccountStoreInvalidatedError();
+      }
+    });
+    this.guardQueue = next.then(() => {}, () => {});
+    return next;
+  }
+
+  async assertCurrent(): Promise<void> {
+    this.throwIfInvalidated();
+    if (!this.snapshot) return;
+    await this.guarded(() => assertAccountSnapshotCurrent(this.snapshot!));
+    this.throwIfInvalidated();
   }
 
   getTotalAccountCount(): number {
@@ -462,6 +527,7 @@ export class AccountManager {
   }
 
   getEnabledAccounts(): ManagedAccount[] {
+    this.throwIfInvalidated();
     return this.accounts.filter((account) => account.enabled !== false);
   }
 
@@ -470,6 +536,7 @@ export class AccountManager {
   }
 
   getCurrentAccountForFamily(family: ModelFamily): ManagedAccount | null {
+    this.throwIfInvalidated();
     const currentIndex = this.currentAccountIndexByFamily[family];
     if (currentIndex >= 0 && currentIndex < this.accounts.length) {
       const account = this.accounts[currentIndex] ?? null;
@@ -513,6 +580,7 @@ export class AccountManager {
     softQuotaCacheTtlMs: number = 10 * 60 * 1000,
     excludeIndices?: Set<number>,
   ): ManagedAccount | null {
+    this.throwIfInvalidated();
     const quotaKey = getQuotaKey(family, headerStyle, model);
 
     if (strategy === 'round-robin') {
@@ -591,6 +659,7 @@ export class AccountManager {
   }
 
   getNextForFamily(family: ModelFamily, model?: string | null, headerStyle: HeaderStyle = "antigravity", softQuotaThresholdPercent: number = 100, softQuotaCacheTtlMs: number = 10 * 60 * 1000, excludeIndices?: Set<number>): ManagedAccount | null {
+    this.throwIfInvalidated();
     const available = this.accounts.filter((a) => {
       clearExpiredRateLimits(a);
       return a.enabled !== false &&
@@ -934,6 +1003,7 @@ export class AccountManager {
   }
 
   toAuthDetails(account: ManagedAccount): OAuthAuthDetails {
+    this.throwIfInvalidated();
     return {
       type: "oauth",
       refresh: formatRefreshParts(account.parts),
@@ -987,10 +1057,22 @@ export class AccountManager {
   }
 
   getAccounts(): ManagedAccount[] {
+    this.throwIfInvalidated();
     return [...this.accounts];
   }
 
   async saveToDisk(): Promise<void> {
+    this.throwIfInvalidated();
+    if (this.snapshot) {
+      await this.guarded(async () => {
+        this.snapshot = await saveAccountSnapshot(this.snapshot!, this.storageForSave(), () => !this.invalidated);
+      });
+      return;
+    }
+    await saveAccounts(this.storageForSave());
+  }
+
+  private storageForSave(): AccountStorageV4 {
     const claudeIndex = Math.max(0, this.currentAccountIndexByFamily.claude);
     const geminiIndex = Math.max(0, this.currentAccountIndexByFamily.gemini);
     
@@ -1024,10 +1106,11 @@ export class AccountManager {
       },
     };
 
-    await saveAccounts(storage);
+    return storage;
   }
 
   requestSaveToDisk(): void {
+    this.throwIfInvalidated();
     if (this.savePending) {
       return;
     }
@@ -1038,11 +1121,16 @@ export class AccountManager {
   }
 
   async flushSaveToDisk(): Promise<void> {
+    this.throwIfInvalidated();
     if (!this.savePending) {
+      if (this.snapshot) {
+        await this.guardQueue;
+        this.throwIfInvalidated();
+      }
       return;
     }
-    return new Promise<void>((resolve) => {
-      this.savePromiseResolvers.push(resolve);
+    return new Promise<void>((resolve, reject) => {
+      this.savePromiseResolvers.push({ resolve, reject });
     });
   }
 
@@ -1054,11 +1142,13 @@ export class AccountManager {
       await this.saveToDisk();
     } catch {
       // best-effort persistence; avoid unhandled rejection from timer-driven saves
+      if (this.snapshot) this.invalidate();
     } finally {
       const resolvers = this.savePromiseResolvers;
       this.savePromiseResolvers = [];
-      for (const resolve of resolvers) {
-        resolve();
+      for (const waiter of resolvers) {
+        if (this.invalidated) waiter.reject(new AccountStoreInvalidatedError());
+        else waiter.resolve();
       }
     }
   }

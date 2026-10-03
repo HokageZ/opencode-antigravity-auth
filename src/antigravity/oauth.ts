@@ -1,4 +1,4 @@
-import { generatePKCE } from "@openauthjs/openauth/pkce";
+import { generatePKCE } from "./pkce";
 
 import {
   ANTIGRAVITY_CLIENT_ID,

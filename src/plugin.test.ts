@@ -28,6 +28,15 @@ vi.mock("./plugin/storage", async (importOriginal) => {
   };
 });
 
+// network.ts binds globalThis.fetch at module load to keep the V2 loopback proxy
+// from re-intercepting interceptor dispatches. Tests stub `fetch` *after* module
+// evaluation, so the captured realFetch would bypass the stub and hit the real
+// Gemini API. Resolve the global dynamically in tests.
+vi.mock("./plugin/network", () => ({
+  realFetch: (input: RequestInfo, init?: RequestInit) =>
+    (globalThis.fetch as typeof fetch)(input, init),
+}));
+
 const { createAntigravityPlugin } = await import("./plugin");
 const storageModule = await import("./plugin/storage");
 
