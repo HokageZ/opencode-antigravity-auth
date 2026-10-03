@@ -1,7 +1,7 @@
 import { extractVariantThinkingConfig } from "./request-helpers";
 import { applyGeminiTransforms, isGemini3Model, mapAntigravityModelToPublicApi, resolveModelForHeaderStyle } from "./transform";
 import type { AntigravityConfig } from "./config";
-import type { GeminiApiModel } from "./config/models";
+import type { GeminiApiModel, GeminiApiModelsResponse } from "./config/models";
 import type { ApiKeyAuthDetails } from "./types";
 import type { RequestPayload, ThinkingTier } from "./transform";
 
@@ -11,10 +11,7 @@ export interface AgySdkCredential {
   projectId?: string;
 }
 
-export interface GeminiApiModelsResponse {
-  models?: GeminiApiModel[];
-  nextPageToken?: string;
-}
+export type { GeminiApiModelsResponse };
 
 interface PreparedAgySdkGeminiRequest {
   request: RequestInfo;
